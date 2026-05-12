@@ -59,18 +59,63 @@ class MBEEngine:
     @staticmethod
     def compute(p, pi, Np, Rp, Rs, Bo, Bg, Wp, Bw,
                 Boi, Bgi, Rsi, Swi, cw, cf, m,
-                Winj=0, Ginj=0, Bginj=0.001):
-        dp = pi - p
+                We=0, Winj=0, Ginj=0, Bginj=0.001,
+                res_type_idx=3, dp=None, solving_for_We=False):
+        # 0: Undersaturated, 1: Gas Cap, 2: Water Drive, 3: Full
+        if dp is None:
+            dp = pi - p
+        
+        # ──────── STRUCTURAL NUMERATOR CONSTRUCTION ────────
+        # 1. Produced Oil & Gas (Always active)
+        numerator = Np * (Bo + (Rp - Rs) * Bg)
+        
+        # 2. Net Water Influx (Active in Water Drive and Full MBE)
+        # Note: res_type_idx == 0 (Undersat) and 1 (Gas Cap) physically exclude water influx entirely
+        if res_type_idx in (2, 3):
+            if solving_for_We:
+                numerator += Wp * Bw
+            else:
+                numerator -= (We - Wp * Bw)
+            
+        # 3. Injection mechanisms (Active in Full MBE)
+        if res_type_idx == 3:
+            numerator -= (Ginj * Bginj)
+            numerator -= (Winj * Bw)
+            
+        m_eff = m if res_type_idx in (1, 3) else 0.0
+        
+        # ──────── STRUCTURAL DENOMINATOR CONSTRUCTION ────────
+        # 4. Evolved Gas Expansion (Always active)
+        denominator = (Bo - Boi) + (Rsi - Rs) * Bg
+        
+        # 5. Gas Cap Expansion
+        gas_cap_expansion_base = Boi * ((Bg / Bgi) - 1.0) if Bgi > 0 else 0.0
+        denominator += m_eff * gas_cap_expansion_base
+            
+        # 6. Rock & Connate Water Expansion (Uses structured m_eff consistency)
+        rock_water_expansion_base = Boi * ((Swi * cw + cf) / (1.0 - Swi)) * dp if Swi < 1.0 else 0.0
+        denominator += (1.0 + m_eff) * rock_water_expansion_base
+
+        # ──────── PRESERVE ORIGINAL FORMS FOR COMPATIBILITY ────────
+        Eo = (Bo - Boi) + (Rsi - Rs) * Bg
+        Eg = gas_cap_expansion_base
+        Efw_star = rock_water_expansion_base
+        Efw = (1.0 + m_eff) * Efw_star
         Bt = Bo + (Rsi - Rs) * Bg
-        F = Np * (Bt + (Rp - Rsi) * Bg) + Wp * Bw
-        Eo = Bt - Boi
-        Eg = Boi * ((Bg / Bgi) - 1.0) if Bgi > 0 else 0.0
-        Efw_star = Boi * ((cw * Swi + cf) / (1.0 - Swi)) * dp if Swi < 1.0 else 0.0
-        Efw = (1.0 + m) * Efw_star
-        Et = Eo + m * Eg + Efw
-        F_adj = F - Winj * Bw - Ginj * Bginj
+        
+        produced_oil_gas = Np * (Bo + (Rp - Rs) * Bg)
+        F = numerator # F aligns exactly with constructed numerator per client 
+        Et = denominator
+        F_adj = numerator 
+        
+        gas_inj_val = (Ginj * Bginj) if res_type_idx == 3 else 0.0
+        winj_val = (Winj * Bw) if res_type_idx == 3 else 0.0
+        
         return dict(dp=dp, Bt=Bt, F=F, F_adj=F_adj,
-                    Eo=Eo, Eg=Eg, Efw_star=Efw_star, Efw=Efw, Et=Et)
+                    Eo=Eo, Eg=Eg, Efw_star=Efw_star, Efw=Efw, Et=Et,
+                    num=numerator, den=denominator,
+                    produced_oil_gas=produced_oil_gas,
+                    gas_inj=gas_inj_val, water_inj=winj_val)
 
     @staticmethod
     def solve_N(F_adj, Et):
@@ -86,15 +131,33 @@ class MBEEngine:
         return F_adj - N * Et
 
     @staticmethod
-    def driving_indexes(N, Eo, m, Eg, Efw, We, Wp, Bw, Winj, Ginj, Bginj):
-        A = N * Eo + N * m * Eg + N * Efw + We - Wp * Bw + Winj * Bw + Ginj * Bginj
+    def driving_indexes(N, Eo, m, Eg, Efw, We, Wp, Bw, Winj, Ginj, Bginj, res_type_idx=3):
+        term_depletion = N * Eo
+        
+        term_gas_cap = 0.0
+        if res_type_idx in (1, 3):
+            term_gas_cap = N * m * Eg
+            
+        term_water = 0.0
+        if res_type_idx in (2, 3):
+            term_water += (We - Wp * Bw)
+        if res_type_idx == 3:
+            term_water += Winj * Bw
+            term_water += Ginj * Bginj
+            
+        term_expansion = N * Efw
+        
+        A = term_depletion + term_gas_cap + term_water + term_expansion
         if abs(A) < 1e-20:
             return dict(DDI=0, SDI=0, WDI=0, EDI=0, Sum=0)
-        DDI = (N * Eo) / A
-        SDI = (N * m * Eg) / A
-        WDI = (We - Wp * Bw + Winj * Bw + Ginj * Bginj) / A
-        EDI = (N * Efw) / A
-        return dict(DDI=DDI, SDI=SDI, WDI=WDI, EDI=EDI, Sum=DDI + SDI + WDI + EDI)
+            
+        return dict(
+            DDI=term_depletion / A,
+            SDI=term_gas_cap / A,
+            WDI=term_water / A,
+            EDI=term_expansion / A,
+            Sum=1.0 # By definition A/A is 1
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -122,7 +185,7 @@ class SinglePointTab(QWidget):
             ("Bg",  "Gas FV factor (rb/scf)",               "0.0012"),
             ("Bgi", "Initial gas FV factor (rb/scf)",       "0.0009"),
             ("We",  "Cumulative water influx (rb)",         "50000"),
-            ("Wp",  "Cumulative water produced (STB)",      "10000"),
+            ("Wp",  "Cumulative water produced (bbl)",      "10000"),
             ("Bw",  "Water FV factor (rb/STB)",             "1.02"),
             ("m",   "Gas cap ratio",                        "0.2"),
         ]
@@ -139,7 +202,7 @@ class SinglePointTab(QWidget):
     @staticmethod
     def _inj_fields():
         return [
-            ("Winj",  "Cumulative water injected (STB)",      "0"),
+            ("Winj",  "Cumulative water injected (bbl)",      "0"),
             ("Ginj",  "Cumulative gas injected (scf)",        "0"),
             ("Bginj", "Injected gas FV factor (rb/scf)",      "0.001"),
         ]
@@ -168,8 +231,21 @@ class SinglePointTab(QWidget):
         lay.addWidget(sub)
 
         # Target selector
-        tg = QGroupBox("Target Calculation")
+        tg = QGroupBox("Configuration")
         tl = QVBoxLayout(tg)
+
+        self.res_type_selector = ScrolllessComboBox()
+        self.res_type_selector.addItems([
+            "Undersaturated Oil Reservoir",
+            "Gas Cap Reservoir",
+            "Water Drive Reservoir",
+            "Full MBE"
+        ])
+        self.res_type_selector.currentIndexChanged.connect(self._on_setup_change)
+        self.res_type_selector.setFixedHeight(35)
+        self.res_type_selector.setObjectName("res_type_selector")
+        self.res_type_selector.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        
         self.target_selector = ScrolllessComboBox()
         self.target_selector.addItems([
             "Original Oil in Place (N)",
@@ -177,10 +253,15 @@ class SinglePointTab(QWidget):
             "Cumulative Water Influx (We)",
             "Primary Driving Indexes",
         ])
-        self.target_selector.currentIndexChanged.connect(self._on_target_change)
+        self.target_selector.currentIndexChanged.connect(self._on_setup_change)
         self.target_selector.setFixedHeight(35)
         self.target_selector.setObjectName("target_selector")
         self.target_selector.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        
+        tl.addWidget(QLabel("1. Reservoir Type:"))
+        tl.addWidget(self.res_type_selector)
+        tl.addSpacing(10)
+        tl.addWidget(QLabel("2. Target Calculation:"))
         tl.addWidget(self.target_selector)
         lay.addWidget(tg)
 
@@ -229,7 +310,8 @@ class SinglePointTab(QWidget):
         wrapper = QVBoxLayout(self)
         wrapper.setContentsMargins(0, 0, 0, 0)
         wrapper.addWidget(scroll_area)
-        self._on_target_change()
+        self.res_type_selector.setCurrentIndex(3) # Set Full MBE default
+        self._on_setup_change()
 
     def _create_fields(self, layout, fields):
         v = QDoubleValidator(-1e15, 1e15, 6, self)
@@ -255,18 +337,58 @@ class SinglePointTab(QWidget):
                 row += 1
 
     # ---- logic ----
-    def _on_target_change(self):
-        idx = self.target_selector.currentIndex()
-        for k in ("N", "m", "We"):
-            self.input_containers[k].setVisible(True)
-        if idx == 0:
-            self.input_containers["N"].setVisible(False)
+    def _on_setup_change(self):
+        res_idx = self.res_type_selector.currentIndex()
+        tgt_idx = self.target_selector.currentIndex()
+
+        # Enforce target validity
+        model = self.target_selector.model()
+        if res_idx == 0:  # Undersaturated
+            model.item(1).setEnabled(False)
+            model.item(2).setEnabled(False)
+            if tgt_idx in (1, 2):
+                self.target_selector.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 1:  # Gas Cap
+            model.item(1).setEnabled(True)
+            model.item(2).setEnabled(False)
+            if tgt_idx == 2:
+                self.target_selector.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 2:  # Water Drive
+            model.item(1).setEnabled(False)
+            model.item(2).setEnabled(True)
+            if tgt_idx == 1:
+                self.target_selector.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 3:  # Full MBE
+            for row in range(4):
+                model.item(row).setEnabled(True)
+
+        for k in ("N", "m", "We", "Ginj", "Winj", "Bginj"):
+            if k in self.input_containers:
+                self.input_containers[k].setVisible(True)
+
+        # Hide structurally irrelevant inputs
+        if res_idx == 0:
+            for k in ("m", "We", "Ginj", "Winj", "Bginj"):
+                if k in self.input_containers: self.input_containers[k].setVisible(False)
+        elif res_idx == 1:
+            for k in ("We", "Winj"):
+                if k in self.input_containers: self.input_containers[k].setVisible(False)
+        elif res_idx == 2:
+            for k in ("m", "Ginj", "Bginj"):
+                if k in self.input_containers: self.input_containers[k].setVisible(False)
+
+        # Hide inputs handled by target logic
+        if tgt_idx == 0:
+            if "N" in self.input_containers: self.input_containers["N"].setVisible(False)
             self.calc_btn.setText("Calculate N")
-        elif idx == 1:
-            self.input_containers["m"].setVisible(False)
+        elif tgt_idx == 1:
+            if "m" in self.input_containers: self.input_containers["m"].setVisible(False)
             self.calc_btn.setText("Calculate m")
-        elif idx == 2:
-            self.input_containers["We"].setVisible(False)
+        elif tgt_idx == 2:
+            if "We" in self.input_containers: self.input_containers["We"].setVisible(False)
             self.calc_btn.setText("Calculate We")
         else:
             self.calc_btn.setText("Calculate Driving Indexes")
@@ -288,45 +410,54 @@ class SinglePointTab(QWidget):
             if v["Swi"] >= 1.0:
                 raise ValueError("Swi must be strictly less than 1.0")
 
-            Efw_star = v["Boi"] * ((v["cw"] * v["Swi"] + v["cf"]) / (1 - v["Swi"])) * v["dp"]
-            Bt = v["Bo"] + (v["Rsi"] - v["Rs"]) * v["Bg"]
-            F = v["Np"] * (Bt + (v["Rp"] - v["Rsi"]) * v["Bg"]) + v["Wp"] * v["Bw"]
-            Eo = Bt - v["Boi"]
-            Eg = v["Boi"] * ((v["Bg"] / v["Bgi"]) - 1.0)
-            idx = self.target_selector.currentIndex()
+            res_type_idx = self.res_type_selector.currentIndex()
+            tgt_idx = self.target_selector.currentIndex()
+            inter = MBEEngine.compute(
+                p=v.get("pi", 0) - v["dp"], pi=v.get("pi", 0), dp=v["dp"],
+                Np=v["Np"], Rp=v["Rp"], Rs=v["Rs"], Bo=v["Bo"], Bg=v["Bg"], Wp=v["Wp"], Bw=v["Bw"],
+                Boi=v["Boi"], Bgi=v["Bgi"], Rsi=v["Rsi"], Swi=v["Swi"], cw=v["cw"], cf=v["cf"],
+                m=v["m"], We=v["We"], Winj=v["Winj"], Ginj=v["Ginj"], Bginj=v["Bginj"],
+                res_type_idx=res_type_idx, solving_for_We=(tgt_idx == 2)
+            )
+            
+            F = inter["F"]
+            Eo = inter["Eo"]
+            Eg = inter["Eg"]
+            Efw_star = inter["Efw_star"]
+            Efw = inter["Efw"]
+            idx = tgt_idx
 
             if idx == 0:
-                Efw = (1 + v["m"]) * Efw_star
-                d = Eo + v["m"] * Eg + Efw
+                d = inter["den"]
                 if d == 0:
-                    raise ZeroDivisionError("Denominator is zero.")
-                r = (F - v["We"] - v["Winj"] * v["Bw"] - v["Ginj"] * v["Bginj"]) / d
+                    raise ZeroDivisionError("Denominator in expanded equation evaluates to zero.")
+                r = inter["num"] / d
                 self._show_ok(f"Original Oil in Place (N):\n{r:,.2f} STB")
             elif idx == 1:
                 if v["N"] == 0:
                     raise ZeroDivisionError("N cannot be zero.")
-                nm = ((F - v["We"] - v["Winj"] * v["Bw"] - v["Ginj"] * v["Bginj"]) / v["N"]) - Eo - Efw_star
+                nm = ((inter["F_adj"]) / v["N"]) - Eo - Efw_star
                 dm = Eg + Efw_star
                 if dm == 0:
                     raise ZeroDivisionError("Denominator is zero.")
                 self._show_ok(f"Size of Gas Cap (m):\n{nm / dm:,.4f}")
             elif idx == 2:
-                Efw = (1 + v["m"]) * Efw_star
-                We_c = F - v["N"] * (Eo + v["m"] * Eg + Efw) - v["Winj"] * v["Bw"] - v["Ginj"] * v["Bginj"]
+                # We from expanded intrinsically matches exactly
+                inner_subtracts = inter["produced_oil_gas"] - (v["Wp"] * v["Bw"]) - inter["gas_inj"] - inter["water_inj"]
+                We_c = v["N"] * inter["Et"] - inner_subtracts
                 self._show_ok(f"Cumulative Water Influx (We):\n{We_c:,.2f} bbl")
             else:
-                Efw = (1 + v["m"]) * Efw_star
-                A = v["N"] * Eo + v["N"] * v["m"] * Eg + v["N"] * Efw + v["We"] - v["Wp"] * v["Bw"] + v["Winj"] * v["Bw"] + v["Ginj"] * v["Bginj"]
-                if A == 0:
+                di = MBEEngine.driving_indexes(
+                    v["N"], inter["Eo"], v["m"], inter["Eg"], inter["Efw"],
+                    v["We"], v["Wp"], v["Bw"], v["Winj"], v["Ginj"], v["Bginj"], 
+                    res_type_idx=res_type_idx
+                )
+                if abs(di["Sum"]) < 1e-10:
                     raise ZeroDivisionError("Net A is zero.")
-                DDI = (v["N"] * Eo) / A * 100
-                SDI = (v["N"] * v["m"] * Eg) / A * 100
-                WDI = (v["We"] - v["Wp"] * v["Bw"] + v["Winj"] * v["Bw"] + v["Ginj"] * v["Bginj"]) / A * 100
-                EDI = (v["N"] * Efw) / A * 100
-                self._show_ok(f"Depletion-Drive (DDI): {DDI:,.2f}%\n"
-                              f"Segregation-Drive (SDI): {SDI:,.2f}%\n"
-                              f"Water-Drive (WDI): {WDI:,.2f}%\n"
-                              f"Expansion-Drive (EDI): {EDI:,.2f}%")
+                self._show_ok(f"Depletion-Drive (DDI): {di['DDI']*100:,.2f}%\n"
+                              f"Segregation-Drive (SDI): {di['SDI']*100:,.2f}%\n"
+                              f"Water-Drive (WDI): {di['WDI']*100:,.2f}%\n"
+                              f"Expansion-Drive (EDI): {di['EDI']*100:,.2f}%")
         except (ValueError, ZeroDivisionError) as e:
             self._show_err(str(e))
         except Exception as e:
@@ -406,15 +537,30 @@ class MultiStepTab(QWidget):
             b.clicked.connect(slot)
             tb.addWidget(b)
 
-        tb.addSpacing(20)
-        tb.addWidget(QLabel("Target:"))
+        tb.addSpacing(15)
+        tb.addWidget(QLabel("Type:"))
+        self.res_type_cb = ScrolllessComboBox()
+        self.res_type_cb.addItems([
+            "Undersaturated Oil",
+            "Gas Cap",
+            "Water Drive",
+            "Full MBE"
+        ])
+        self.res_type_cb.setFixedHeight(32)
+        self.res_type_cb.setMinimumWidth(160)
+        self.res_type_cb.setObjectName("res_type_selector")
+        self.res_type_cb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.res_type_cb.currentIndexChanged.connect(self._on_setup_change)
+        tb.addWidget(self.res_type_cb)
+
+        tb.addWidget(QLabel("  Target:"))
         self.target_cb = ScrolllessComboBox()
         self.target_cb.addItems(TARGET_OPTIONS)
         self.target_cb.setFixedHeight(32)
-        self.target_cb.setMinimumWidth(200)
+        self.target_cb.setMinimumWidth(180)
         self.target_cb.setObjectName("target_selector")
         self.target_cb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.target_cb.currentIndexChanged.connect(self._on_target_change)
+        self.target_cb.currentIndexChanged.connect(self._on_setup_change)
         tb.addWidget(self.target_cb)
 
         tb.addStretch()
@@ -527,13 +673,53 @@ class MultiStepTab(QWidget):
         self.status = QLabel("📂 Import a CSV file or generate a template to begin.")
         self.status.setObjectName("subtitle")
         root.addWidget(self.status)
-        self._on_target_change()
+        self.res_type_cb.setCurrentIndex(3)
+        self._on_setup_change()
 
-    # ──────── target change ────────
-    def _on_target_change(self):
-        idx = self.target_cb.currentIndex()
-        self.const_containers["N"].setVisible(idx != 0)
-        self.const_containers["m"].setVisible(idx != 1)
+    # ──────── setup change ────────
+    def _on_setup_change(self):
+        res_idx = self.res_type_cb.currentIndex()
+        tgt_idx = self.target_cb.currentIndex()
+
+        # Enforce target validity
+        model = self.target_cb.model()
+        if res_idx == 0:  # Undersaturated
+            model.item(1).setEnabled(False)
+            model.item(2).setEnabled(False)
+            if tgt_idx in (1, 2):
+                self.target_cb.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 1:  # Gas Cap
+            model.item(1).setEnabled(True)
+            model.item(2).setEnabled(False)
+            if tgt_idx == 2:
+                self.target_cb.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 2:  # Water Drive
+            model.item(1).setEnabled(False)
+            model.item(2).setEnabled(True)
+            if tgt_idx == 1:
+                self.target_cb.setCurrentIndex(0)
+                tgt_idx = 0
+        elif res_idx == 3:  # Full
+            for row in range(4):
+                model.item(row).setEnabled(True)
+
+        for k in ("N", "m", "Bginj"):
+            if k in self.const_containers:
+                self.const_containers[k].setVisible(True)
+
+        if res_idx == 0:
+            if "m" in self.const_containers: self.const_containers["m"].setVisible(False)
+            if "Bginj" in self.const_containers: self.const_containers["Bginj"].setVisible(False)
+        elif res_idx == 2:
+            if "m" in self.const_containers: self.const_containers["m"].setVisible(False)
+            if "Bginj" in self.const_containers: self.const_containers["Bginj"].setVisible(False)
+
+        if tgt_idx == 0 and "N" in self.const_containers:
+            self.const_containers["N"].setVisible(False)
+        elif tgt_idx == 1 and "m" in self.const_containers:
+            self.const_containers["m"].setVisible(False)
 
     # ──────── CSV template ────────
     def _gen_template(self):
@@ -615,6 +801,8 @@ class MultiStepTab(QWidget):
             m_val = self._get_const("m") if idx != 1 else 0.0
             N_val = self._get_const("N") if idx != 0 else 0.0
 
+            res_type_idx = self.res_type_cb.currentIndex()
+
             self.results = []
             for row in self.raw_data:
                 inter = MBEEngine.compute(
@@ -622,27 +810,32 @@ class MultiStepTab(QWidget):
                     Rs=row["Rs"], Bo=row["Bo"], Bg=row["Bg"],
                     Wp=row["Wp"], Bw=row["Bw"], Boi=Boi, Bgi=Bgi,
                     Rsi=Rsi, Swi=Swi, cw=cw, cf=cf, m=m_val,
-                    Winj=row["Winj"], Ginj=row["Ginj"], Bginj=Bginj,
+                    We=0.0,
+                    Winj=row.get("Winj", 0), Ginj=row.get("Ginj", 0), Bginj=Bginj,
+                    res_type_idx=res_type_idx, dp=None, solving_for_We=(idx == 2)
                 )
                 res = dict(Timestep=row["Timestep"], p=row["p"], **inter)
                 res["Wp"] = row["Wp"]
-                res["Winj"] = row["Winj"]
-                res["Ginj"] = row["Ginj"]
+                res["Winj"] = row.get("Winj", 0)
+                res["Ginj"] = row.get("Ginj", 0)
                 res["Bw"] = row["Bw"]
 
-                if idx == 0:
-                    res["N_calc"] = MBEEngine.solve_N(inter["F_adj"], inter["Et"])
+                if idx == 0: # Solve for N expanding form directly
+                    res["N_calc"] = inter["num"] / inter["den"] if inter["den"] != 0 else float('nan')
                 elif idx == 1:
                     res["m_calc"] = MBEEngine.solve_m(inter["F_adj"], N_val, inter["Eo"], inter["Eg"], inter["Efw_star"])
                 elif idx == 2:
-                    res["We_calc"] = MBEEngine.solve_We(inter["F_adj"], N_val, inter["Et"])
-                # Driving Indexes (always compute if possible)
+                    inner_subtracts = inter["produced_oil_gas"] - (row["Wp"] * row["Bw"]) - inter["gas_inj"] - inter["water_inj"]
+                    res["We_calc"] = N_val * inter["Et"] - inner_subtracts
+                
+                # Driving Indexes
                 We_for_di = res.get("We_calc", 0.0)
                 N_for_di = res.get("N_calc", N_val)
-                m_for_di = res.get("m_calc", m_val)
                 di = MBEEngine.driving_indexes(
-                    N_for_di, inter["Eo"], m_for_di, inter["Eg"], inter["Efw"],
-                    We_for_di, row["Wp"], row["Bw"], row["Winj"], row["Ginj"], Bginj)
+                    N_for_di, inter["Eo"], m_val, inter["Eg"], inter["Efw"],
+                    We_for_di, row["Wp"], row["Bw"], row.get("Winj", 0), row.get("Ginj", 0), Bginj,
+                    res_type_idx=res_type_idx
+                )
                 res.update(di)
                 self.results.append(res)
 
